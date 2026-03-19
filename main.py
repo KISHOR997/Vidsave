@@ -9,8 +9,8 @@ import re
 import asyncio
 import uuid
 import shutil
-
-
+import os
+import tempfile
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMP_DIR = Path("/tmp/vidssave_downloads")
@@ -20,12 +20,10 @@ app = FastAPI(title="VidSave - YouTube to MP4 Converter")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
-# ─── ffmpeg config ───────────────────────────────────────────────────────────
-# If ffmpeg is in your PATH leave as None.
-# Otherwise set full path: r"C:\ffmpeg\bin\ffmpeg.exe"
-FFMPEG_MANUAL_PATH = None
+# ─── ffmpeg ──────────────────────────────────────────────────────────────────
+FFMPEG_MANUAL_PATH = None  # e.g. r"C:\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe"
 
-def _find_ffmpeg_dir() -> str | None:
+def _find_ffmpeg_dir():
     if FFMPEG_MANUAL_PATH:
         p = Path(FFMPEG_MANUAL_PATH)
         if p.exists():
@@ -34,9 +32,10 @@ def _find_ffmpeg_dir() -> str | None:
     return str(Path(which).parent) if which else None
 
 FFMPEG_DIR = _find_ffmpeg_dir()
-print(f"[VidSave] ffmpeg: {'FOUND at ' + FFMPEG_DIR if FFMPEG_DIR else 'NOT FOUND — only pre-muxed streams available'}")
-# ─────────────────────────────────────────────────────────────────────────────
+print(f"[VidSave] ffmpeg: {'FOUND at ' + FFMPEG_DIR if FFMPEG_DIR else 'NOT FOUND'}")
 
+
+# ─── models ──────────────────────────────────────────────────────────────────
 
 class ConvertRequest(BaseModel):
     url: str
@@ -47,6 +46,8 @@ class DownloadRequest(BaseModel):
     quality: str
     format: str = "mp4"
 
+
+# ─── constants ───────────────────────────────────────────────────────────────
 
 FORMATS = ["mp4", "mp3", "webm", "avi"]
 
@@ -94,109 +95,81 @@ def format_filesize(b):
 def safe_name(t: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", t).strip()[:80]
 
+
+# ─── cookies ─────────────────────────────────────────────────────────────────
+
+_cookie_tmp_path = None  # module-level cache
+
+def _get_cookie_file() -> str | None:
+    global _cookie_tmp_path
+
+    # 1. Local cookies.txt file
+    local = BASE_DIR / "cookies.txt"
+    if local.exists():
+        return str(local)
+
+    # 2. Environment variable (Render deployment)
+    cookie_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if cookie_content:
+        if _cookie_tmp_path and Path(_cookie_tmp_path).exists():
+            return _cookie_tmp_path
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False
+        )
+        tmp.write(cookie_content)
+        tmp.flush()
+        tmp.close()
+        _cookie_tmp_path = tmp.name
+        print(f"[VidSave] cookies loaded from env → {_cookie_tmp_path}")
+        return _cookie_tmp_path
+
+    return None
+
+
 def base_opts() -> dict:
-    o = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    o = {
+        "quiet":       True,
+        "no_warnings": True,
+        "noplaylist":  True,
+    }
     if FFMPEG_DIR:
         o["ffmpeg_location"] = FFMPEG_DIR
-    # Add cookies file
-    cookies = BASE_DIR / "cookies.txt"
-    if cookies.exists():
-        o["cookiefile"] = str(cookies)
+
+    cookie_file = _get_cookie_file()
+    if cookie_file:
+        o["cookiefile"] = cookie_file
+
     return o
 
-# ─── format selection ────────────────────────────────────────────────────────
 
-def _classify(formats: list) -> tuple[list, list, list]:
-    """Split formats into video-only, audio-only, muxed."""
-    video, audio, muxed = [], [], []
-    for f in formats:
-        vco = (f.get("vcodec") or "none").lower()
-        aco = (f.get("acodec") or "none").lower()
-        h   = f.get("height") or 0
-        has_v = vco != "none"
-        has_a = aco != "none"
-        if has_v and not has_a and h > 0:
-            video.append(f)
-        elif has_a and not has_v:
-            audio.append(f)
-        elif has_v and has_a and h > 0:
-            muxed.append(f)
-    return video, audio, muxed
+# ─── format string builder (single yt-dlp call, no format_id picking) ────────
 
-
-def _best_video_at(video_fmts: list, target: int) -> dict | None:
+def _build_format(height: int, container: str, has_ffmpeg: bool) -> str:
     """
-    Pick the video-only format whose height is the CLOSEST to target
-    from below (never above). Among ties, highest bitrate wins.
-    Prefer mp4/avc1 for compatibility.
+    Build a yt-dlp format string that resolves in a single call.
+    Uses format_sort to pin the resolution instead of brittle format IDs.
+
+    format_sort=[res:N] tells yt-dlp: rank formats by closeness to N,
+    so the best match at that resolution wins — not the global best.
+    We set this on the opts dict, not in the format string itself.
     """
-    cands = [f for f in video_fmts if (f.get("height") or 0) <= target]
-    if not cands:
-        return None
-    max_h = max(f["height"] for f in cands)
-    # Only keep formats AT the closest height (not everything below)
-    at_h  = [f for f in cands if f["height"] == max_h]
-    # Prefer mp4 container
-    mp4   = [f for f in at_h if f.get("ext") == "mp4"]
-    pool  = mp4 if mp4 else at_h
-    return sorted(pool, key=lambda f: f.get("tbr") or f.get("vbr") or 0, reverse=True)[0]
+    if container == "mp3":
+        return "bestaudio/best"
 
-
-def _best_audio(audio_fmts: list) -> dict | None:
-    if not audio_fmts:
-        return None
-    # Prefer m4a (compatible with mp4 container)
-    m4a  = [f for f in audio_fmts if f.get("ext") == "m4a"]
-    pool = m4a if m4a else audio_fmts
-    return sorted(pool, key=lambda f: f.get("abr") or f.get("tbr") or 0, reverse=True)[0]
-
-
-def _best_muxed_at(muxed_fmts: list, target: int) -> dict | None:
-    cands = [f for f in muxed_fmts if (f.get("height") or 0) <= target]
-    if not cands:
-        return None
-    max_h = max(f["height"] for f in cands)
-    at_h  = [f for f in cands if f["height"] == max_h]
-    return sorted(at_h, key=lambda f: f.get("tbr") or 0, reverse=True)[0]
-
-
-def _select_format_id(all_formats: list, target: int, container: str) -> tuple[str, int, bool]:
-    """
-    Returns (format_id_string, actual_height, needs_ffmpeg).
-    Raises ValueError if no suitable format found.
-    """
-    video, audio, muxed = _classify(all_formats)
-
-    if FFMPEG_DIR:
-        # With ffmpeg: pick exact video-only + audio-only, merge them
-        best_v = _best_video_at(video, target)
-        best_a = _best_audio(audio)
-
-        if best_v and best_a:
-            fmt_str = f"{best_v['format_id']}+{best_a['format_id']}"
-            actual  = best_v["height"]
-            print(f"[VidSave] MERGE {fmt_str}  "
-                  f"(video={best_v['height']}p ext={best_v.get('ext')} "
-                  f"tbr={best_v.get('tbr'):.0f}, "
-                  f"audio ext={best_a.get('ext')} "
-                  f"abr={best_a.get('abr') or best_a.get('tbr'):.0f})")
-            return fmt_str, actual, False
-
-        if best_v:
-            print(f"[VidSave] VIDEO-ONLY {best_v['format_id']} ({best_v['height']}p)")
-            return best_v["format_id"], best_v["height"], False
-
-    # No ffmpeg OR no video-only streams: must use pre-muxed
-    best_m = _best_muxed_at(muxed, target)
-    if best_m:
-        actual = best_m["height"]
-        print(f"[VidSave] MUXED {best_m['format_id']} ({actual}p)")
-        return best_m["format_id"], actual, False
-
-    raise ValueError(
-        f"No suitable format found for {target}p. "
-        "Install ffmpeg to unlock HD downloads."
-    )
+    if has_ffmpeg:
+        # Merge best video at/below height with best audio
+        return (
+            f"bestvideo[height<={height}][ext=mp4]"
+            f"+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={height}]+bestaudio/"
+            f"best[height<={height}]"
+        )
+    else:
+        # No ffmpeg — pre-muxed only
+        return (
+            f"best[height<={height}][vcodec!=none][acodec!=none]/"
+            f"best[height<={height}]"
+        )
 
 
 # ─── yt-dlp workers ──────────────────────────────────────────────────────────
@@ -205,46 +178,54 @@ def _fetch_info(url: str) -> dict:
     with yt_dlp.YoutubeDL(base_opts()) as ydl:
         info = ydl.extract_info(url, download=False)
 
-    all_fmts         = info.get("formats", [])
-    video, audio, mx = _classify(all_fmts)
+    all_fmts = info.get("formats", [])
 
-    available_heights = sorted(
-        set(f["height"] for f in video),
-        reverse=True
-    )
-    muxed_heights = sorted(
-        set(f["height"] for f in mx),
-        reverse=True
-    )
-    print(f"[VidSave] Video-only heights: {available_heights}")
-    print(f"[VidSave] Muxed heights:      {muxed_heights}")
-    print(f"[VidSave] ffmpeg available:   {bool(FFMPEG_DIR)}")
+    # Heights with a real video stream
+    video_heights = sorted(set(
+        f["height"] for f in all_fmts
+        if (f.get("vcodec") or "none") != "none"
+        and f.get("height")
+    ), reverse=True)
+
+    # Heights with pre-muxed (video+audio)
+    muxed_heights = sorted(set(
+        f["height"] for f in all_fmts
+        if (f.get("vcodec") or "none") != "none"
+        and (f.get("acodec") or "none") != "none"
+        and f.get("height")
+    ), reverse=True)
+
+    print(f"[VidSave] video heights: {video_heights}")
+    print(f"[VidSave] muxed heights: {muxed_heights}")
 
     qualities = []
     for res, height in QUALITY_HEIGHT.items():
         meta = QUALITY_META[res]
 
-        # Check availability
-        has_video_at  = any(f["height"] <= height for f in video)
-        has_muxed_at  = any((f.get("height") or 0) <= height for f in mx)
-        is_available  = (FFMPEG_DIR and has_video_at) or has_muxed_at
+        has_video = any(h <= height for h in video_heights)
+        has_muxed = any(h <= height for h in muxed_heights)
+        available = (FFMPEG_DIR and has_video) or has_muxed
 
-        # Get file size estimate from the best video format at this height
-        best_v = _best_video_at(video, height) if FFMPEG_DIR else None
-        best_m = _best_muxed_at(mx, height)
-        ref    = best_v or best_m
-        size   = format_filesize(
+        # Best size estimate
+        cands = [
+            f for f in all_fmts
+            if (f.get("height") or 0) <= height
+            and (f.get("vcodec") or "none") != "none"
+        ]
+        cands.sort(key=lambda f: f.get("height") or 0, reverse=True)
+        ref      = cands[0] if cands else None
+        size_str = format_filesize(
             ref.get("filesize") or ref.get("filesize_approx")
         ) if ref else "—"
 
         qualities.append({
             "res":          res,
             "label":        meta["label"],
-            "size":         size,
+            "size":         size_str,
             "badge":        meta["badge"],
             "badge_class":  meta["badge_class"],
-            "available":    is_available,
-            "needs_ffmpeg": not is_available and has_video_at,
+            "available":    available,
+            "needs_ffmpeg": not available and has_video,
         })
 
     return {
@@ -266,42 +247,37 @@ def _download_file(url: str, quality: str, fmt: str):
     out_dir = TEMP_DIR / uuid.uuid4().hex
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[VidSave] ── Download: {quality} ({target}p) as {fmt} ──")
+    print(f"\n[VidSave] Download: {quality} ({target}p) as {fmt}")
 
-    # Phase 1: fetch format list
-    with yt_dlp.YoutubeDL(base_opts()) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    all_fmts = info.get("formats", [])
-    title    = info.get("title", "video")
-
-    # Phase 2: build download opts
     dl = base_opts()
     dl["outtmpl"] = str(out_dir / "%(title)s.%(ext)s")
 
     if fmt == "mp3":
-        _, audio, _ = _classify(all_fmts)
-        best_a      = _best_audio(audio)
-        dl["format"] = best_a["format_id"] if best_a else "bestaudio/best"
+        dl["format"] = "bestaudio/best"
         if FFMPEG_DIR:
             dl["postprocessors"] = [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
+                "key":              "FFmpegExtractAudio",
+                "preferredcodec":   "mp3",
                 "preferredquality": "192",
             }]
     else:
-        fmt_str, actual_h, _ = _select_format_id(all_fmts, target, fmt)
-        dl["format"] = fmt_str
-        print(f"[VidSave] Using format_id='{fmt_str}'  actual={actual_h}p")
+        dl["format"] = _build_format(target, fmt, bool(FFMPEG_DIR))
 
-        if FFMPEG_DIR and "+" in fmt_str:
+        # format_sort pins resolution — this is the key to getting the RIGHT quality
+        # res:N = rank formats closest to N first (not just "anything below N")
+        dl["format_sort"] = [f"res:{target}", "ext:mp4:m4a", "codec:avc:m4a"]
+
+        if FFMPEG_DIR:
             dl["merge_output_format"] = fmt
 
-    # Phase 3: download
-    with yt_dlp.YoutubeDL(dl) as ydl:
-        ydl.extract_info(url, download=True)
+    print(f"[VidSave] format='{dl['format']}'  format_sort={dl.get('format_sort')}")
 
-    # Phase 4: locate file
+    # Single call — fetch info + download in one shot (avoids format_id mismatch)
+    with yt_dlp.YoutubeDL(dl) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+    title = info.get("title", "video")
+
     files = [
         f for f in sorted(out_dir.iterdir())
         if f.suffix not in (".part", ".ytdl", ".temp")
@@ -312,7 +288,7 @@ def _download_file(url: str, quality: str, fmt: str):
         raise RuntimeError("yt-dlp produced no output file.")
 
     final = files[0]
-    print(f"[VidSave] Saved: {final.name}  ({final.stat().st_size // 1024} KB)\n")
+    print(f"[VidSave] Saved: {final.name}  ({final.stat().st_size // 1024} KB)")
     return final, title
 
 
