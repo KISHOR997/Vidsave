@@ -10,8 +10,10 @@ import asyncio
 import uuid
 import shutil
 
+
+
 BASE_DIR = Path(__file__).resolve().parent
-TEMP_DIR = BASE_DIR / "downloads"
+TEMP_DIR = Path("/tmp/vidssave_downloads")
 TEMP_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title="VidSave - YouTube to MP4 Converter")
@@ -21,7 +23,7 @@ templates = Jinja2Templates(directory=BASE_DIR / "templates")
 # ─── ffmpeg config ───────────────────────────────────────────────────────────
 # If ffmpeg is in your PATH leave as None.
 # Otherwise set full path: r"C:\ffmpeg\bin\ffmpeg.exe"
-FFMPEG_MANUAL_PATH = r"C:\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe"
+FFMPEG_MANUAL_PATH = None
 
 def _find_ffmpeg_dir() -> str | None:
     if FFMPEG_MANUAL_PATH:
