@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>VidSave — YouTube to MP4</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+<div class="page">
+
+  <!-- ── Hero ── -->
+  <div class="hero">
+    <div class="logo">
+      <div class="logo-icon"><div class="logo-play"></div></div>
+      <span class="logo-text">VidSave</span>
+    </div>
+    <h1>YouTube to MP4 converter</h1>
+    <p class="subtitle">Download YouTube videos in HD quality — fast, free, no registration</p>
+
+    <!-- URL Input -->
+    <div class="search-box" id="search-box">
+      <svg class="search-icon" width="16" height="16" viewBox="0 0 16 16" fill="none">
+        <circle cx="7" cy="7" r="4.5" stroke="#555" stroke-width="1.2"/>
+        <line x1="10.5" y1="10.5" x2="14" y2="14" stroke="#555" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+      <input id="url-input" type="text" placeholder="Paste YouTube link here..." autocomplete="off"/>
+      <button class="btn-convert" id="convert-btn" onclick="handleConvert()">Convert</button>
+    </div>
+    <div class="error-msg" id="error-msg"></div>
+
+    <!-- Format Tabs — rendered from Python -->
+    <div class="tabs-row" id="tabs-row">
+      {% for fmt in formats %}
+      <button
+        class="ftab {% if loop.first %}active{% endif %}"
+        data-f="{{ fmt }}"
+        onclick="selectFormat(this)"
+      >{{ fmt.upper() }}</button>
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- ── Result Card (hidden until convert) ── -->
+  <div class="result-card hidden" id="result-area">
+
+    <!-- Video Meta -->
+    <div class="video-meta" id="video-meta">
+      <div class="thumb">
+        <img id="thumb-img" src="" alt="thumbnail"/>
+        <div class="thumb-overlay">
+          <div class="thumb-play-btn"></div>
+        </div>
+      </div>
+      <div class="meta-info">
+        <div class="meta-title" id="vid-title">—</div>
+        <div class="meta-sub" id="vid-sub">—</div>
+        <div class="meta-badges">
+          <span class="badge">YouTube</span>
+          <span class="badge" id="fmt-badge">MP4</span>
+          <span class="badge">Up to 4K</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Loading spinner -->
+    <div class="loading-row hidden" id="loading-row">
+      <div class="spinner"></div>
+      <span>Fetching video info…</span>
+    </div>
+
+    <!-- Quality List -->
+    <div id="quality-list"></div>
+  </div>
+
+  <!-- ── How it works ── -->
+  <div class="how-section">
+    <div class="section-label">How it works</div>
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-line"></div>
+        <div class="step-label">Paste URL</div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-line"></div>
+        <div class="step-label">Pick quality</div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-line"></div>
+        <div class="step-label">Download</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Features ── -->
+  <div class="features">
+    <div class="section-label">Features</div>
+    <div class="feat-grid">
+      <div class="feat">
+        <div class="feat-icon red-icon">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M8 2l1.5 4h4l-3 2.5 1 4L8 10l-3.5 2.5 1-4L2.5 6h4z" fill="#ff3b3b"/>
+          </svg>
+        </div>
+        <div class="feat-label">4K quality</div>
+        <div class="feat-sub">Up to 2160p resolution</div>
+      </div>
+      <div class="feat">
+        <div class="feat-icon green-icon">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <circle cx="8" cy="8" r="5.5" stroke="#5ec96a" stroke-width="1.2"/>
+            <path d="M5.5 8l2 2 3-3" stroke="#5ec96a" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="feat-label">No sign-up</div>
+        <div class="feat-sub">100% free forever</div>
+      </div>
+      <div class="feat">
+        <div class="feat-icon blue-icon">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M8 3v5l3 2" stroke="#5ba3e0" stroke-width="1.2" stroke-linecap="round"/>
+            <circle cx="8" cy="8" r="5.5" stroke="#5ba3e0" stroke-width="1.2"/>
+          </svg>
+        </div>
+        <div class="feat-label">Fast</div>
+        <div class="feat-sub">Instant conversion</div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /page -->
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
