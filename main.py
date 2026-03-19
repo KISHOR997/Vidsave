@@ -98,8 +98,11 @@ def base_opts() -> dict:
     o = {"quiet": True, "no_warnings": True, "noplaylist": True}
     if FFMPEG_DIR:
         o["ffmpeg_location"] = FFMPEG_DIR
+    # Add cookies file
+    cookies = BASE_DIR / "cookies.txt"
+    if cookies.exists():
+        o["cookiefile"] = str(cookies)
     return o
-
 
 # ─── format selection ────────────────────────────────────────────────────────
 
