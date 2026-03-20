@@ -144,25 +144,6 @@ def base_opts() -> dict:
 
 # ─── format string builder (single yt-dlp call, no format_id picking) ────────
 
-def _build_format(height: int, container: str, has_ffmpeg: bool) -> str:
-    if container == "mp3":
-        return "bestaudio/best"
-
-    if has_ffmpeg:
-        # No ext filters — let format_sort pick the best codec available
-        # on this server. Removing [ext=mp4] prevents "format not available"
-        # errors when YouTube only serves webm/vp9 to certain IPs.
-        return (
-            f"bestvideo[height<={height}]+bestaudio/"
-            f"best[height<={height}]"
-        )
-    else:
-        return (
-            f"best[height<={height}][vcodec!=none][acodec!=none]/"
-            f"best[height<={height}]"
-        )
-
-
 # ─── yt-dlp workers ──────────────────────────────────────────────────────────
 
 def _fetch_info(url: str) -> dict:
@@ -244,7 +225,8 @@ def _download_file(url: str, quality: str, fmt: str):
     dl["outtmpl"] = str(out_dir / "%(title)s.%(ext)s")
 
     if fmt == "mp3":
-        dl["format"] = "bestaudio/best"
+        dl["format"]      = "bestaudio/best"
+        dl["format_sort"] = ["abr", "ext:m4a:webm"]
         if FFMPEG_DIR:
             dl["postprocessors"] = [{
                 "key":              "FFmpegExtractAudio",
@@ -252,20 +234,31 @@ def _download_file(url: str, quality: str, fmt: str):
                 "preferredquality": "192",
             }]
     else:
-        dl["format"] = _build_format(target, fmt, bool(FFMPEG_DIR))
-
-        # format_sort pins resolution — this is the key to getting the RIGHT quality
-        # res:N = rank formats closest to N first (not just "anything below N")
-        dl["format_sort"] = [f"res:{target}"]
-
+        # KEY INSIGHT: never put height filter in format string on server IPs —
+        # YouTube restricts available formats per IP and [height<=N] causes
+        # "format not available". Instead use format_sort ONLY to pin resolution.
+        # bestvideo*+bestaudio/best = most permissive selector, accepts any codec.
+        # format_sort res:N = picks stream closest to target height automatically.
         if FFMPEG_DIR:
+            dl["format"]             = "bestvideo*+bestaudio/best"
             dl["merge_output_format"] = fmt
+        else:
+            dl["format"] = "best"
+
+        dl["format_sort"] = [
+            f"res:{target}",   # closest to requested resolution
+            "fps",             # prefer higher fps among same res
+            "vcodec:h264",     # prefer h264 for compatibility
+            "+size",           # prefer smaller among ties
+        ]
 
     print(f"[VidSave] format='{dl['format']}'  format_sort={dl.get('format_sort')}")
 
-    # Single call — fetch info + download in one shot (avoids format_id mismatch)
     with yt_dlp.YoutubeDL(dl) as ydl:
         info = ydl.extract_info(url, download=True)
+
+    if not info:
+        raise RuntimeError("yt-dlp returned no info.")
 
     title = info.get("title", "video")
 
