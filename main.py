@@ -112,13 +112,16 @@ def cookie_file():
 
 # ---------- yt-dlp opts ----------
 
-def base_opts() -> dict:
+def base_opts(client: str = "ios") -> dict:
     o = {
         "quiet":        True,
         "no_warnings":  True,
         "noplaylist":   True,
-        # iOS client gets the full format list on any IP including cloud servers
-        "extractor_args": {"youtube": {"player_client": ["ios"]}},
+        "extractor_args": {
+            "youtube": {
+                "player_client": [client],
+            }
+        },
     }
     if FFMPEG_DIR:
         o["ffmpeg_location"] = FFMPEG_DIR
@@ -128,11 +131,35 @@ def base_opts() -> dict:
     return o
 
 
+def yt_extract(url: str, download: bool, extra_opts: dict = None) -> dict:
+    """
+    Try multiple YouTube player clients in order until one works.
+    This handles bot detection and IP-based format restrictions.
+    """
+    clients   = ["ios", "android", "tv_embedded", "web"]
+    last_err  = None
+
+    for client in clients:
+        opts = base_opts(client)
+        if extra_opts:
+            opts.update(extra_opts)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=download)
+            print(f"[VidSave] success with client={client}")
+            return info
+        except yt_dlp.utils.DownloadError as e:
+            print(f"[VidSave] client={client} failed: {e}")
+            last_err = e
+            continue
+
+    raise last_err
+
+
 # ---------- workers ----------
 
 def _fetch_info(url: str) -> dict:
-    with yt_dlp.YoutubeDL(base_opts()) as ydl:
-        info = ydl.extract_info(url, download=False)
+    info = yt_extract(url, download=False)
 
     fmts = info.get("formats", [])
 
@@ -230,8 +257,12 @@ def _download_file(url: str, quality: str, fmt: str):
     print(f"[VidSave] format      = {dl['format']}")
     print(f"[VidSave] format_sort = {dl.get('format_sort')}")
 
-    with yt_dlp.YoutubeDL(dl) as ydl:
-        info = ydl.extract_info(url, download=True)
+    # Pass dl opts as extra — yt_extract will try multiple clients
+    # Remove keys already in base_opts to avoid duplication
+    extra = {k: v for k, v in dl.items()
+             if k not in ("quiet","no_warnings","noplaylist",
+                          "ffmpeg_location","cookiefile","extractor_args")}
+    info = yt_extract(url, download=True, extra_opts=extra)
 
     title = (info or {}).get("title", "video")
     files = [f for f in sorted(out_dir.iterdir())
@@ -267,8 +298,18 @@ async def convert(payload: ConvertRequest):
     try:
         data = await asyncio.to_thread(_fetch_info, url)
     except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(422, f"yt-dlp: {e}")
+        msg = str(e)
+        print(f"[VidSave] convert error: {msg}")
+        # Give user a friendly message
+        if "Sign in" in msg or "bot" in msg.lower():
+            raise HTTPException(422, "YouTube blocked this request. Try again in a moment.")
+        if "not available" in msg:
+            raise HTTPException(422, "This video is not available for download.")
+        if "Private" in msg or "private" in msg:
+            raise HTTPException(422, "This video is private.")
+        raise HTTPException(422, f"Could not fetch video: {msg}")
     except Exception as e:
+        print(f"[VidSave] convert exception: {e}")
         raise HTTPException(500, str(e))
     return JSONResponse({"success": True, **data, "format": payload.format})
 

@@ -17,6 +17,7 @@ async function handleConvert() {
   const box     = document.getElementById("search-box");
 
   currentUrl = input.value.trim();
+  console.log("Converting URL:", currentUrl, "Format:", currentFormat);
   errorEl.textContent = "";
   box.classList.remove("error");
 
