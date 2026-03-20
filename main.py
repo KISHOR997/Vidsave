@@ -8,7 +8,7 @@ import re
 import asyncio
 import uuid
 import httpx
-import shutil
+import os
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMP_DIR = Path("/tmp/vidssave")
@@ -18,16 +18,14 @@ app = FastAPI(title="VidSave")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
-# Cobalt API endpoint — no API key needed, completely free
-COBALT_API = "https://api.cobalt.tools/"
+# ── RapidAPI config ───────────────────────────────────────────────────────────
+# Get your free key at https://rapidapi.com/ytjar/api/yt-api
+# Add RAPIDAPI_KEY to Render environment variables
+RAPIDAPI_KEY  = os.environ.get("RAPIDAPI_KEY", "")
+RAPIDAPI_HOST = "yt-api.p.rapidapi.com"
+RAPIDAPI_BASE = "https://yt-api.p.rapidapi.com"
+# ─────────────────────────────────────────────────────────────────────────────
 
-COBALT_HEADERS = {
-    "Accept":       "application/json",
-    "Content-Type": "application/json",
-}
-
-
-# ---------- models ----------
 
 class ConvertRequest(BaseModel):
     url: str
@@ -39,9 +37,7 @@ class DownloadRequest(BaseModel):
     format: str = "mp4"
 
 
-# ---------- constants ----------
-
-FORMATS = ["mp4", "mp3", "webm"]
+FORMATS = ["mp4", "mp3"]
 
 YT_REGEX = re.compile(
     r"(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w\-]+"
@@ -64,8 +60,6 @@ QUALITY_META = {
 }
 
 
-# ---------- helpers ----------
-
 def fmt_views(n):
     if not n: return "—"
     if n >= 1e9: return f"{n/1e9:.1f}B views"
@@ -75,141 +69,165 @@ def fmt_views(n):
 
 def fmt_dur(s):
     if not s: return "—"
-    m, s = divmod(int(s), 60); h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    try:
+        s = int(s)
+        m, s = divmod(s, 60); h, m = divmod(m, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    except:
+        return str(s)
 
 def safe_name(t: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", t).strip()[:80]
 
+def extract_id(url: str) -> str:
+    m = re.search(r"(?:v=|youtu\.be/)([\w\-]{11})", url)
+    return m.group(1) if m else ""
 
-# ---------- cobalt API ----------
+def rapidapi_headers() -> dict:
+    return {
+        "x-rapidapi-key":  RAPIDAPI_KEY,
+        "x-rapidapi-host": RAPIDAPI_HOST,
+    }
 
-async def cobalt_fetch_info(url: str) -> dict:
-    """
-    Ping Cobalt with the URL to verify it's valid and get basic info.
-    Cobalt doesn't have a separate metadata endpoint so we probe with
-    720p to confirm the URL works, then return mock quality cards.
-    All qualities are marked available — Cobalt handles them all.
-    """
+
+# ── RapidAPI workers ──────────────────────────────────────────────────────────
+
+async def _fetch_info(url: str) -> dict:
+    vid_id = extract_id(url)
+    if not vid_id:
+        raise ValueError("Invalid YouTube URL")
+
     async with httpx.AsyncClient(timeout=30) as client:
-        res = await client.post(
-            COBALT_API,
-            json={
-                "url":           url,
-                "videoQuality":  "720",
-                "filenameStyle": "pretty",
-            },
-            headers=COBALT_HEADERS,
+        # Get video info + formats
+        res = await client.get(
+            f"{RAPIDAPI_BASE}/info",
+            params={"id": vid_id},
+            headers=rapidapi_headers(),
         )
 
+    if res.status_code != 200:
+        print(f"[VidSave] RapidAPI info error: {res.status_code} {res.text[:200]}")
+        raise ValueError(f"API error {res.status_code}: {res.text[:100]}")
+
     data = res.json()
-    print(f"[VidSave] cobalt probe: status={data.get('status')} "
-          f"code={res.status_code}")
+    print(f"[VidSave] info fetched: {data.get('title', '?')[:50]}")
 
-    status = data.get("status", "")
-    if status == "error":
-        code = data.get("error", {}).get("code", "unknown")
-        raise ValueError(f"Cobalt error: {code}")
+    # Extract available formats
+    formats     = data.get("formats", [])
+    vid_formats = [f for f in formats if f.get("qualityLabel")]
 
-    if status not in ("stream", "redirect", "tunnel", "picker"):
-        raise ValueError(f"Unexpected Cobalt status: {status}")
-
-    # Build quality list — Cobalt supports all of these
+    # Build quality list
     qualities = []
     for res_label, height in QUALITY_HEIGHT.items():
         meta = QUALITY_META[res_label]
+        # Find a matching format
+        match = next(
+            (f for f in vid_formats
+             if str(height) in str(f.get("qualityLabel", ""))),
+            None
+        )
         qualities.append({
             "res":         res_label,
             "label":       meta["label"],
-            "size":        "—",        # Cobalt doesn't give file sizes upfront
+            "size":        "—",
             "badge":       meta["badge"],
             "badge_class": meta["badge_class"],
-            "available":   True,
+            "available":   match is not None,
             "needs_ffmpeg": False,
         })
 
-    # Extract filename hint from Cobalt response for title
-    filename = data.get("filename", "")
-    title    = filename.rsplit(".", 1)[0] if filename else "YouTube Video"
-
     return {
         "video": {
-            "title":     title or "YouTube Video",
-            "channel":   "YouTube",
-            "duration":  "—",
-            "views":     "—",
-            "thumbnail": f"https://img.youtube.com/vi/"
-                         f"{_extract_vid_id(url)}/hqdefault.jpg",
-            "video_id":  _extract_vid_id(url),
+            "title":     data.get("title", "Unknown"),
+            "channel":   data.get("channelTitle", "YouTube"),
+            "duration":  fmt_dur(data.get("lengthSeconds")),
+            "views":     fmt_views(data.get("viewCount")),
+            "thumbnail": data.get("thumbnail", [{}])[-1].get("url", "")
+                         if isinstance(data.get("thumbnail"), list)
+                         else f"https://img.youtube.com/vi/{vid_id}/hqdefault.jpg",
+            "video_id":  vid_id,
         },
         "qualities":    qualities,
-        "ffmpeg_ready": True,  # Cobalt handles merging server-side
+        "ffmpeg_ready": True,
     }
 
 
-async def cobalt_download(url: str, quality: str, fmt: str) -> tuple[Path, str]:
-    """
-    Download video via Cobalt API at the requested quality.
-    Cobalt merges video+audio server-side — no ffmpeg needed locally.
-    """
-    height  = QUALITY_HEIGHT.get(quality, 720)
+async def _download_file(url: str, quality: str, fmt: str):
+    vid_id  = extract_id(url)
+    target  = QUALITY_HEIGHT.get(quality, 720)
     out_dir = TEMP_DIR / uuid.uuid4().hex
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build Cobalt request
-    payload = {
-        "url":           url,
-        "videoQuality":  str(height),
-        "filenameStyle": "pretty",
-    }
+    print(f"\n[VidSave] download {quality} ({target}p) as {fmt}")
 
-    if fmt == "mp3":
-        payload["downloadMode"] = "audio"
-    else:
-        payload["downloadMode"] = "auto"
+    async with httpx.AsyncClient(timeout=30) as client:
+        if fmt == "mp3":
+            res = await client.get(
+                f"{RAPIDAPI_BASE}/dl",
+                params={"id": vid_id, "cgeo": "US"},
+                headers=rapidapi_headers(),
+            )
+        else:
+            res = await client.get(
+                f"{RAPIDAPI_BASE}/dl",
+                params={"id": vid_id, "cgeo": "US"},
+                headers=rapidapi_headers(),
+            )
 
-    print(f"[VidSave] cobalt request: quality={height} fmt={fmt}")
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        res = await client.post(
-            COBALT_API,
-            json=payload,
-            headers=COBALT_HEADERS,
-        )
+    if res.status_code != 200:
+        raise ValueError(f"API error {res.status_code}")
 
     data = res.json()
-    print(f"[VidSave] cobalt response: {data.get('status')} "
-          f"filename={data.get('filename')}")
+    print(f"[VidSave] dl response status={data.get('status')}")
 
-    status = data.get("status", "")
+    # Find the right format URL
+    formats     = data.get("formats", [])
+    download_url = None
+    title        = data.get("title", "video")
 
-    if status == "error":
-        code = data.get("error", {}).get("code", "unknown")
-        raise ValueError(f"Cobalt: {code}")
-
-    if status == "picker":
-        # Multiple streams — pick first video
-        streams = data.get("picker", [])
-        video_streams = [s for s in streams if s.get("type") == "video"]
-        download_url  = (video_streams or streams)[0]["url"]
-        filename      = data.get("filename") or f"video_{quality}.mp4"
-
-    elif status in ("stream", "redirect", "tunnel"):
-        download_url = data.get("url")
-        filename     = data.get("filename") or f"video_{quality}.mp4"
-
+    if fmt == "mp3":
+        # Get audio format
+        audio_fmts = [f for f in formats if f.get("hasAudio") and not f.get("hasVideo")]
+        if audio_fmts:
+            download_url = audio_fmts[0].get("url")
+        else:
+            # fallback: adaptiveFormats audio
+            adaptive = data.get("adaptiveFormats", [])
+            audio    = [f for f in adaptive if "audio" in f.get("mimeType", "")]
+            if audio:
+                download_url = audio[0].get("url")
     else:
-        raise ValueError(f"Unexpected Cobalt status: {status}")
+        # Find video format closest to target quality
+        video_fmts = [
+            f for f in formats
+            if f.get("qualityLabel") and f.get("url")
+        ]
+        # Sort by closeness to target
+        def quality_diff(f):
+            label = f.get("qualityLabel", "0p")
+            try:
+                h = int(re.search(r"\d+", label).group())
+                return abs(h - target)
+            except:
+                return 9999
+
+        video_fmts.sort(key=quality_diff)
+        if video_fmts:
+            download_url = video_fmts[0].get("url")
+            print(f"[VidSave] picked format: {video_fmts[0].get('qualityLabel')}")
 
     if not download_url:
-        raise ValueError("Cobalt returned no download URL")
+        # last resort: use the direct url from response
+        download_url = data.get("url")
+
+    if not download_url:
+        raise ValueError("No download URL found in API response")
 
     # Stream file to disk
-    ext      = "mp3" if fmt == "mp3" else filename.rsplit(".", 1)[-1]
-    out_file = out_dir / f"video_{quality}.{ext}"
+    ext      = "mp3" if fmt == "mp3" else "mp4"
+    out_file = out_dir / f"{safe_name(title)}.{ext}"
 
-    print(f"[VidSave] downloading from cobalt → {out_file.name}")
-
+    print(f"[VidSave] streaming → {out_file.name}")
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(None, connect=30),
         follow_redirects=True
@@ -222,43 +240,38 @@ async def cobalt_download(url: str, quality: str, fmt: str) -> tuple[Path, str]:
 
     size_kb = out_file.stat().st_size // 1024
     print(f"[VidSave] saved: {out_file.name} ({size_kb} KB)")
-
-    title = filename.rsplit(".", 1)[0] if filename else "video"
     return out_file, title
 
 
-def _extract_vid_id(url: str) -> str:
-    m = re.search(r"(?:v=|youtu\.be/)([\w\-]{11})", url)
-    return m.group(1) if m else ""
-
-
-# ---------- routes ----------
+# ── routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    has_key = bool(RAPIDAPI_KEY)
     return templates.TemplateResponse("index.html", {
         "request":      request,
         "formats":      FORMATS,
         "ffmpeg_ready": True,
+        "has_api_key":  has_key,
     })
 
 
 @app.post("/api/convert")
 async def convert(payload: ConvertRequest):
+    if not RAPIDAPI_KEY:
+        raise HTTPException(500, "RAPIDAPI_KEY not configured. Add it to environment variables.")
     url = payload.url.strip()
     if not url:
         raise HTTPException(400, "URL is required.")
     if not YT_REGEX.search(url):
         raise HTTPException(422, "Please enter a valid YouTube URL.")
-    if payload.format not in FORMATS:
-        raise HTTPException(422, f"Unsupported format: {payload.format}")
 
     try:
-        data = await cobalt_fetch_info(url)
+        data = await _fetch_info(url)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except httpx.TimeoutException:
-        raise HTTPException(422, "Cobalt API timed out. Try again.")
+        raise HTTPException(422, "Request timed out. Try again.")
     except Exception as e:
         print(f"[VidSave] convert error: {e}")
         raise HTTPException(500, str(e))
@@ -268,22 +281,20 @@ async def convert(payload: ConvertRequest):
 
 @app.post("/api/download")
 async def download(payload: DownloadRequest):
+    if not RAPIDAPI_KEY:
+        raise HTTPException(500, "RAPIDAPI_KEY not configured.")
     url = payload.url.strip()
     if not YT_REGEX.search(url):
         raise HTTPException(422, "Invalid YouTube URL.")
     if payload.quality not in QUALITY_HEIGHT:
         raise HTTPException(422, f"Invalid quality: {payload.quality}")
-    if payload.format not in FORMATS:
-        raise HTTPException(422, f"Invalid format: {payload.format}")
 
     try:
-        file_path, title = await cobalt_download(
-            url, payload.quality, payload.format
-        )
+        file_path, title = await _download_file(url, payload.quality, payload.format)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except httpx.TimeoutException:
-        raise HTTPException(422, "Download timed out. Try a lower quality.")
+        raise HTTPException(422, "Download timed out.")
     except Exception as e:
         print(f"[VidSave] download error: {e}")
         raise HTTPException(500, str(e))
@@ -298,4 +309,8 @@ async def download(payload: DownloadRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "backend": "cobalt"}
+    return {
+        "status":  "ok",
+        "backend": "rapidapi",
+        "api_key": "set" if RAPIDAPI_KEY else "MISSING",
+    }
