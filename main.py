@@ -145,27 +145,18 @@ def base_opts() -> dict:
 # ─── format string builder (single yt-dlp call, no format_id picking) ────────
 
 def _build_format(height: int, container: str, has_ffmpeg: bool) -> str:
-    """
-    Build a yt-dlp format string that resolves in a single call.
-    Uses format_sort to pin the resolution instead of brittle format IDs.
-
-    format_sort=[res:N] tells yt-dlp: rank formats by closeness to N,
-    so the best match at that resolution wins — not the global best.
-    We set this on the opts dict, not in the format string itself.
-    """
     if container == "mp3":
         return "bestaudio/best"
 
     if has_ffmpeg:
-        # Merge best video at/below height with best audio
+        # No ext filters — let format_sort pick the best codec available
+        # on this server. Removing [ext=mp4] prevents "format not available"
+        # errors when YouTube only serves webm/vp9 to certain IPs.
         return (
-            f"bestvideo[height<={height}][ext=mp4]"
-            f"+bestaudio[ext=m4a]/"
             f"bestvideo[height<={height}]+bestaudio/"
             f"best[height<={height}]"
         )
     else:
-        # No ffmpeg — pre-muxed only
         return (
             f"best[height<={height}][vcodec!=none][acodec!=none]/"
             f"best[height<={height}]"
@@ -265,7 +256,7 @@ def _download_file(url: str, quality: str, fmt: str):
 
         # format_sort pins resolution — this is the key to getting the RIGHT quality
         # res:N = rank formats closest to N first (not just "anything below N")
-        dl["format_sort"] = [f"res:{target}", "ext:mp4:m4a", "codec:avc:m4a"]
+        dl["format_sort"] = [f"res:{target}"]
 
         if FFMPEG_DIR:
             dl["merge_output_format"] = fmt
