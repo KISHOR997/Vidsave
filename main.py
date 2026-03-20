@@ -131,26 +131,62 @@ def base_opts(client: str = "ios") -> dict:
     return o
 
 
+def _find_node() -> str | None:
+    """Find node.js binary — needed by yt-dlp for JS extraction."""
+    for candidate in ["node", "nodejs"]:
+        p = shutil.which(candidate)
+        if p:
+            return p
+    for path in ["/usr/bin/node", "/usr/local/bin/node",
+                 "/usr/bin/nodejs", "/usr/local/bin/nodejs"]:
+        if Path(path).exists():
+            return path
+    return None
+
+NODE_PATH = _find_node()
+print(f"[VidSave] node.js: {NODE_PATH or 'NOT FOUND'}")
+
+
 def yt_extract(url: str, download: bool, extra_opts: dict = None) -> dict:
     """
     Try multiple YouTube player clients in order until one works.
-    This handles bot detection and IP-based format restrictions.
+    Clients that don't need JS (mweb, ios) are tried first.
     """
-    clients   = ["ios", "android", "tv_embedded", "web"]
-    last_err  = None
+    # mweb and ios don't require JS runtime — try them first
+    # web_creator, android_vr also bypass JS in most cases
+    clients = [
+        "mweb",          # mobile web — most reliable on cloud IPs
+        "ios",           # iOS app client
+        "android",       # Android app client
+        "android_vr",    # Android VR — different format list
+        "web_creator",   # YouTube Studio client
+        "tv_embedded",   # TV embedded player
+        "web",           # standard web (needs JS)
+    ]
+    last_err = None
 
     for client in clients:
         opts = base_opts(client)
+
+        # Pass node.js path if found — helps web client
+        if NODE_PATH:
+            opts["extractor_args"]["youtube"]["js_player_path"] = NODE_PATH
+
         if extra_opts:
             opts.update(extra_opts)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=download)
-            print(f"[VidSave] success with client={client}")
-            return info
+            if info:
+                print(f"[VidSave] success with client={client}")
+                return info
         except yt_dlp.utils.DownloadError as e:
             print(f"[VidSave] client={client} failed: {e}")
             last_err = e
+            continue
+        except Exception as e:
+            print(f"[VidSave] client={client} exception: {e}")
+            last_err = yt_dlp.utils.DownloadError(str(e))
             continue
 
     raise last_err
