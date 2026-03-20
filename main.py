@@ -13,29 +13,31 @@ import os
 import tempfile
 
 BASE_DIR = Path(__file__).resolve().parent
-TEMP_DIR = Path("/tmp/vidssave_downloads")
+TEMP_DIR = Path("/tmp/vidssave")
 TEMP_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="VidSave - YouTube to MP4 Converter")
+app = FastAPI(title="VidSave")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
-# ─── ffmpeg ──────────────────────────────────────────────────────────────────
-FFMPEG_MANUAL_PATH = None  # e.g. r"C:\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe"
+# Set manually if ffmpeg not in PATH:
+# FFMPEG_MANUAL_PATH = r"C:\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe"
+FFMPEG_MANUAL_PATH = None
 
-def _find_ffmpeg_dir():
+def _find_ffmpeg():
     if FFMPEG_MANUAL_PATH:
         p = Path(FFMPEG_MANUAL_PATH)
         if p.exists():
             return str(p.parent)
-    which = shutil.which("ffmpeg")
-    return str(Path(which).parent) if which else None
+    w = shutil.which("ffmpeg")
+    return str(Path(w).parent) if w else None
 
-FFMPEG_DIR = _find_ffmpeg_dir()
-print(f"[VidSave] ffmpeg: {'FOUND at ' + FFMPEG_DIR if FFMPEG_DIR else 'NOT FOUND'}")
+FFMPEG_DIR = _find_ffmpeg()
+print(f"[VidSave] ffmpeg: {'FOUND → ' + FFMPEG_DIR if FFMPEG_DIR else 'NOT FOUND'}")
+print(f"[VidSave] yt-dlp version: {yt_dlp.version.__version__}")
 
 
-# ─── models ──────────────────────────────────────────────────────────────────
+# ---------- models ----------
 
 class ConvertRequest(BaseModel):
     url: str
@@ -47,22 +49,15 @@ class DownloadRequest(BaseModel):
     format: str = "mp4"
 
 
-# ─── constants ───────────────────────────────────────────────────────────────
+# ---------- constants ----------
 
 FORMATS = ["mp4", "mp3", "webm", "avi"]
-
-YT_REGEX = re.compile(
-    r"(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w\-]+"
-)
+YT_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w\-]+")
 
 QUALITY_HEIGHT = {
-    "2160p": 2160,
-    "1080p": 1080,
-    "720p":  720,
-    "480p":  480,
-    "360p":  360,
+    "2160p": 2160, "1080p": 1080,
+    "720p":  720,  "480p":  480, "360p": 360,
 }
-
 QUALITY_META = {
     "2160p": {"label": "Ultra HD · 4K", "badge": "4K",  "badge_class": "uhd"},
     "1080p": {"label": "Full HD",        "badge": "FHD", "badge_class": "fhd"},
@@ -72,140 +67,117 @@ QUALITY_META = {
 }
 
 
-# ─── helpers ─────────────────────────────────────────────────────────────────
+# ---------- helpers ----------
 
-def format_views(n):
-    if n is None: return "—"
+def fmt_views(n):
+    if not n: return "—"
     if n >= 1e9: return f"{n/1e9:.1f}B views"
     if n >= 1e6: return f"{n/1e6:.1f}M views"
     if n >= 1e3: return f"{n/1e3:.1f}K views"
     return f"{n} views"
 
-def format_duration(s):
+def fmt_dur(s):
     if not s: return "—"
-    m, s = divmod(int(s), 60)
-    h, m = divmod(m, 60)
+    m, s = divmod(int(s), 60); h, m = divmod(m, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
-def format_filesize(b):
+def fmt_size(b):
     if not b: return "—"
     mb = b / 1048576
     return f"~{mb/1024:.1f} GB" if mb >= 1024 else f"~{int(mb)} MB"
 
-def safe_name(t: str) -> str:
+def safe_name(t):
     return re.sub(r'[\\/*?:"<>|]', "", t).strip()[:80]
 
 
-# ─── cookies ─────────────────────────────────────────────────────────────────
+# ---------- cookies ----------
 
-_cookie_tmp_path = None  # module-level cache
+_cookie_tmp = None
 
-def _get_cookie_file() -> str | None:
-    global _cookie_tmp_path
-
-    # 1. Local cookies.txt file
+def cookie_file():
+    global _cookie_tmp
     local = BASE_DIR / "cookies.txt"
     if local.exists():
         return str(local)
-
-    # 2. Environment variable (Render deployment)
-    cookie_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
-    if cookie_content:
-        if _cookie_tmp_path and Path(_cookie_tmp_path).exists():
-            return _cookie_tmp_path
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False
-        )
-        tmp.write(cookie_content)
-        tmp.flush()
-        tmp.close()
-        _cookie_tmp_path = tmp.name
-        print(f"[VidSave] cookies loaded from env → {_cookie_tmp_path}")
-        return _cookie_tmp_path
-
+    env = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if env:
+        if _cookie_tmp and Path(_cookie_tmp).exists():
+            return _cookie_tmp
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        f.write(env); f.flush(); f.close()
+        _cookie_tmp = f.name
+        return _cookie_tmp
     return None
 
 
+# ---------- yt-dlp opts ----------
+
 def base_opts() -> dict:
     o = {
-        "quiet":       True,
-        "no_warnings": True,
-        "noplaylist":  True,
+        "quiet":        True,
+        "no_warnings":  True,
+        "noplaylist":   True,
+        # iOS client gets the full format list on any IP including cloud servers
+        "extractor_args": {"youtube": {"player_client": ["ios"]}},
     }
     if FFMPEG_DIR:
         o["ffmpeg_location"] = FFMPEG_DIR
-
-    cookie_file = _get_cookie_file()
-    if cookie_file:
-        o["cookiefile"] = cookie_file
-
+    cf = cookie_file()
+    if cf:
+        o["cookiefile"] = cf
     return o
 
 
-# ─── format string builder (single yt-dlp call, no format_id picking) ────────
-
-# ─── yt-dlp workers ──────────────────────────────────────────────────────────
+# ---------- workers ----------
 
 def _fetch_info(url: str) -> dict:
     with yt_dlp.YoutubeDL(base_opts()) as ydl:
         info = ydl.extract_info(url, download=False)
 
-    all_fmts = info.get("formats", [])
+    fmts = info.get("formats", [])
 
-    # Heights with a real video stream
-    video_heights = sorted(set(
-        f["height"] for f in all_fmts
-        if (f.get("vcodec") or "none") != "none"
-        and f.get("height")
+    # All heights that have a video stream
+    v_heights = sorted(set(
+        f["height"] for f in fmts
+        if f.get("height") and (f.get("vcodec") or "none") != "none"
     ), reverse=True)
 
-    # Heights with pre-muxed (video+audio)
-    muxed_heights = sorted(set(
-        f["height"] for f in all_fmts
-        if (f.get("vcodec") or "none") != "none"
+    # Heights that are pre-muxed (video+audio, no ffmpeg needed)
+    m_heights = sorted(set(
+        f["height"] for f in fmts
+        if f.get("height")
+        and (f.get("vcodec") or "none") != "none"
         and (f.get("acodec") or "none") != "none"
-        and f.get("height")
     ), reverse=True)
 
-    print(f"[VidSave] video heights: {video_heights}")
-    print(f"[VidSave] muxed heights: {muxed_heights}")
+    print(f"[VidSave] video heights : {v_heights}")
+    print(f"[VidSave] muxed heights : {m_heights}")
 
     qualities = []
-    for res, height in QUALITY_HEIGHT.items():
-        meta = QUALITY_META[res]
+    for res, h in QUALITY_HEIGHT.items():
+        meta      = QUALITY_META[res]
+        has_v     = any(x <= h for x in v_heights)
+        has_m     = any(x <= h for x in m_heights)
+        available = (FFMPEG_DIR and has_v) or has_m
 
-        has_video = any(h <= height for h in video_heights)
-        has_muxed = any(h <= height for h in muxed_heights)
-        available = (FFMPEG_DIR and has_video) or has_muxed
-
-        # Best size estimate
-        cands = [
-            f for f in all_fmts
-            if (f.get("height") or 0) <= height
-            and (f.get("vcodec") or "none") != "none"
-        ]
-        cands.sort(key=lambda f: f.get("height") or 0, reverse=True)
-        ref      = cands[0] if cands else None
-        size_str = format_filesize(
-            ref.get("filesize") or ref.get("filesize_approx")
-        ) if ref else "—"
+        ref = next((
+            f for f in sorted(fmts, key=lambda x: x.get("height") or 0, reverse=True)
+            if (f.get("height") or 0) <= h and (f.get("vcodec") or "none") != "none"
+        ), None)
 
         qualities.append({
-            "res":          res,
-            "label":        meta["label"],
-            "size":         size_str,
-            "badge":        meta["badge"],
-            "badge_class":  meta["badge_class"],
-            "available":    available,
-            "needs_ffmpeg": not available and has_video,
+            "res": res, "label": meta["label"],
+            "size": fmt_size(ref.get("filesize") or ref.get("filesize_approx")) if ref else "—",
+            "badge": meta["badge"], "badge_class": meta["badge_class"],
+            "available": available, "needs_ffmpeg": not available and has_v,
         })
 
     return {
         "video": {
             "title":     info.get("title", "Unknown"),
-            "channel":   info.get("uploader") or info.get("channel", "Unknown"),
-            "duration":  format_duration(info.get("duration")),
-            "views":     format_views(info.get("view_count")),
+            "channel":   info.get("uploader") or info.get("channel", "?"),
+            "duration":  fmt_dur(info.get("duration")),
+            "views":     fmt_views(info.get("view_count")),
             "thumbnail": info.get("thumbnail", ""),
             "video_id":  info.get("id", ""),
         },
@@ -219,73 +191,69 @@ def _download_file(url: str, quality: str, fmt: str):
     out_dir = TEMP_DIR / uuid.uuid4().hex
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[VidSave] Download: {quality} ({target}p) as {fmt}")
+    print(f"\n[VidSave] ── download {quality} ({target}p) as {fmt} ──")
 
-    dl = base_opts()
+    dl           = base_opts()
     dl["outtmpl"] = str(out_dir / "%(title)s.%(ext)s")
 
     if fmt == "mp3":
         dl["format"]      = "bestaudio/best"
-        dl["format_sort"] = ["abr", "ext:m4a:webm"]
+        dl["format_sort"] = ["abr"]
         if FFMPEG_DIR:
             dl["postprocessors"] = [{
-                "key":              "FFmpegExtractAudio",
-                "preferredcodec":   "mp3",
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
                 "preferredquality": "192",
             }]
+
     else:
-        # KEY INSIGHT: never put height filter in format string on server IPs —
-        # YouTube restricts available formats per IP and [height<=N] causes
-        # "format not available". Instead use format_sort ONLY to pin resolution.
-        # bestvideo*+bestaudio/best = most permissive selector, accepts any codec.
-        # format_sort res:N = picks stream closest to target height automatically.
+        # ── Proven working on cloud IPs ──────────────────────────────────────
+        # 1. format = "b" means "best single stream" — never triggers
+        #    "format not available" because it always exists.
+        # 2. format_sort pins the resolution WITHOUT filtering.
+        #    res:N = closest to N wins. No [height<=N] filter needed.
+        # 3. If ffmpeg available, use bestvideo*+bestaudio for merged output.
+        # ─────────────────────────────────────────────────────────────────────
         if FFMPEG_DIR:
-            dl["format"]             = "bestvideo*+bestaudio/best"
+            dl["format"]              = "bestvideo*+bestaudio/b"
             dl["merge_output_format"] = fmt
         else:
-            dl["format"] = "best"
+            dl["format"] = "b"   # best pre-muxed single stream
 
         dl["format_sort"] = [
-            f"res:{target}",   # closest to requested resolution
-            "fps",             # prefer higher fps among same res
-            "vcodec:h264",     # prefer h264 for compatibility
-            "+size",           # prefer smaller among ties
+            f"res:{target}",    # pin to requested resolution
+            "fps",
+            "vcodec:h264",
+            "+size",
         ]
 
-    print(f"[VidSave] format='{dl['format']}'  format_sort={dl.get('format_sort')}")
+    print(f"[VidSave] format      = {dl['format']}")
+    print(f"[VidSave] format_sort = {dl.get('format_sort')}")
 
     with yt_dlp.YoutubeDL(dl) as ydl:
         info = ydl.extract_info(url, download=True)
 
-    if not info:
-        raise RuntimeError("yt-dlp returned no info.")
-
-    title = info.get("title", "video")
-
-    files = [
-        f for f in sorted(out_dir.iterdir())
-        if f.suffix not in (".part", ".ytdl", ".temp")
-    ]
+    title = (info or {}).get("title", "video")
+    files = [f for f in sorted(out_dir.iterdir())
+             if f.suffix not in (".part", ".ytdl", ".temp")]
     if not files:
         files = sorted(out_dir.iterdir())
     if not files:
-        raise RuntimeError("yt-dlp produced no output file.")
+        raise RuntimeError("No output file produced.")
 
     final = files[0]
-    print(f"[VidSave] Saved: {final.name}  ({final.stat().st_size // 1024} KB)")
+    print(f"[VidSave] output: {final.name} ({final.stat().st_size // 1024} KB)")
     return final, title
 
 
-# ─── routes ──────────────────────────────────────────────────────────────────
+# ---------- routes ----------
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {
-        "request":      request,
-        "formats":      FORMATS,
+        "request": request, "formats": FORMATS,
         "ffmpeg_ready": FFMPEG_DIR is not None,
     })
-
 
 @app.post("/api/convert")
 async def convert(payload: ConvertRequest):
@@ -304,7 +272,6 @@ async def convert(payload: ConvertRequest):
         raise HTTPException(500, str(e))
     return JSONResponse({"success": True, **data, "format": payload.format})
 
-
 @app.post("/api/download")
 async def download(payload: DownloadRequest):
     url = payload.url.strip()
@@ -318,8 +285,6 @@ async def download(payload: DownloadRequest):
         file_path, title = await asyncio.to_thread(
             _download_file, url, payload.quality, payload.format
         )
-    except ValueError as e:
-        raise HTTPException(422, str(e))
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(422, f"yt-dlp: {e}")
     except Exception as e:
@@ -332,7 +297,7 @@ async def download(payload: DownloadRequest):
         media_type="application/octet-stream",
     )
 
-
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ffmpeg": FFMPEG_DIR is not None}
+    return {"status": "ok", "ffmpeg": FFMPEG_DIR is not None,
+            "yt_dlp": yt_dlp.version.__version__}
