@@ -234,23 +234,13 @@ def _download_file(url: str, quality: str, fmt: str):
             }]
 
     else:
-        # ── Proven working on cloud IPs ──────────────────────────────────────
-        # 1. format = "b" means "best single stream" — never triggers
-        #    "format not available" because it always exists.
-        # 2. format_sort pins the resolution WITHOUT filtering.
-        #    res:N = closest to N wins. No [height<=N] filter needed.
-        # 3. If ffmpeg available, use bestvideo*+bestaudio for merged output.
-        # ─────────────────────────────────────────────────────────────────────
-        if FFMPEG_DIR:
-            dl["format"]              = "bestvideo*+bestaudio/b"
-            dl["merge_output_format"] = fmt
-        else:
-            dl["format"] = "b"   # best pre-muxed single stream
-
+        # Use "b" (best single pre-muxed stream) — ALWAYS available on any IP.
+        # format_sort controls which resolution gets picked.
+        # No merging, no filters = no "format not available" errors.
+        dl["format"]      = "b"
         dl["format_sort"] = [
-            f"res:{target}",    # pin to requested resolution
+            f"res:{target}",  # closest to requested height wins
             "fps",
-            "vcodec:h264",
             "+size",
         ]
 
